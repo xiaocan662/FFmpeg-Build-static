@@ -13,11 +13,8 @@ on:
         type: string
 
 env:
-  TARGET_ARCH: x64
-  BUILD_TYPE: Release
-  MSVC_RUNTIME: MultiThreaded
-  D_WORK_ROOT: D:\ffmpeg-build
-  FFMPEG_PREFIX: D:\ffmpeg-build\ffmpeg-output
+  D_WORK_ROOT: D:/ffmpeg-build
+  FFMPEG_PREFIX: D:/ffmpeg-build/ffmpeg-output
 
 jobs:
   build:
@@ -26,19 +23,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 1. 先安装 MSYS2 & 编译依赖
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          update: true
+          install: base-devel nasm yasm perl git
+
+      # 2. 加载 MSVC2022 编译器（关键：给 FFmpeg msvc 工具链使用）
       - name: Setup MSVC 2022
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: ${{ env.TARGET_ARCH }}
+          arch: x64
           toolset: 14.4
 
-      - name: Install build dependencies
-        run: |
-          choco install nasm yasm perl git --no-progress
-          refreshenv
-
+      # 判定 FFmpeg 分支
       - name: Set FFmpeg checkout ref
         id: set_ref
+        shell: pwsh
         run: |
           if ("${{ github.event.inputs.ffmpeg_ref }}" -eq "") {
             echo "ffmpeg_ref=master" >> $env:GITHUB_OUTPUT
@@ -46,47 +49,56 @@ jobs:
             echo "ffmpeg_ref=${{ github.event.inputs.ffmpeg_ref }}" >> $env:GITHUB_OUTPUT
           }
 
-      - name: Create D drive dir & Clone FFmpeg source
+      # 创建D盘目录 + 拉取源码
+      - name: Clone FFmpeg source
+        shell: msys2 {0}
         run: |
-          mkdir ${{ env.D_WORK_ROOT }} -Force
+          mkdir -p ${{ env.D_WORK_ROOT }}
           cd ${{ env.D_WORK_ROOT }}
           git clone --depth 1 --branch ${{ steps.set_ref.outputs.ffmpeg_ref }} https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
 
+      # FFmpeg 配置：MSVC + MT 静态运行时 + 功能全开
       - name: Configure FFmpeg
-        working-directory: ${{ env.D_WORK_ROOT }}\ffmpeg-src
+        shell: msys2 {0}
+        working-directory: ${{ env.D_WORK_ROOT }}/ffmpeg-src
         run: |
-          set CFLAGS=-MT
-          set CXXFLAGS=-MT
-          set LDFLAGS=-MT
-          ./configure `
-            --toolchain=msvc `
-            --enable-static `
-            --disable-shared `
-            --enable-wasapi `
-            --enable-nvenc `
-            --enable-qsv `
-            --enable-amf `
-            --enable-d3d11va `
-            --enable-dxva2 `
-            --disable-programs `
-            --disable-ffmpeg `
-            --disable-ffplay `
-            --disable-ffprobe `
-            --disable-doc `
-            --disable-debug `
-            --enable-runtime-cpudetect `
+          export CFLAGS="-MT"
+          export CXXFLAGS="-MT"
+          export LDFLAGS="-MT"
+          ./configure \
+            --toolchain=msvc \
+            --enable-static \
+            --disable-shared \
+            --enable-wasapi \
+            --enable-nvenc \
+            --enable-qsv \
+            --enable-amf \
+            --enable-d3d11va \
+            --enable-dxva2 \
+            --disable-programs \
+            --disable-ffmpeg \
+            --disable-ffplay \
+            --disable-ffprobe \
+            --disable-doc \
+            --disable-debug \
+            --enable-runtime-cpudetect \
             --prefix=${{ env.FFMPEG_PREFIX }}
 
+      # 编译 & 安装
       - name: Build & Install FFmpeg
-        working-directory: ${{ env.D_WORK_ROOT }}\ffmpeg-src
+        shell: msys2 {0}
+        working-directory: ${{ env.D_WORK_ROOT }}/ffmpeg-src
         run: |
-          make -j%NUMBER_OF_PROCESSORS% V=1
-          make install V=1
+          make -j$(nproc)
+          make install
 
-      - name: Archive build artifacts
+      # 打包（PowerShell 压缩）
+      - name: Archive artifacts
+        shell: pwsh
         run: |
-          Compress-Archive -Path ${{ env.FFMPEG_PREFIX }}\* -DestinationPath ${{ github.workspace }}\ffmpeg-wasapi-hwenc-msvc2022-x64.zip
+          Compress-Archive -Path ${{ env.FFMPEG_PREFIX }}\* -DestinationPath ${{ github.workspace }}\ffmpeg-wasapi-hwenc-msvc2022-x64.zip -Force
 
+      # 上传制品
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -94,7 +106,9 @@ jobs:
           path: ffmpeg-wasapi-hwenc-msvc2022-x64.zip
           retention-days: 30
 
+      # 创建 Git 标签
       - name: Create Git Tag
+        shell: pwsh
         run: |
           $tag = "${{ github.event.inputs.release_tag }}"
           git config --global user.name "GitHub Actions"
@@ -102,6 +116,7 @@ jobs:
           git tag -f $tag
           git push origin -f $tag
 
+      # 发布 Release
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -112,10 +127,10 @@ jobs:
             - 编译器: MSVC 2022 (v14.4)
             - 架构: x64
             - 运行时: MT 静态多线程运行时库
-            - 音频: 启用 WASAPI
-            - 硬件编码: NVENC(N卡) / QSV(I卡) / AMF(A卡)
+            - 音频: WASAPI
+            - 硬件编码: NVENC / QSV / AMF
             - 硬件解码: D3D11VA / DXVA2
-            - 类型: 纯静态库（仅头文件+lib，无可执行程序）
+            - 类型: MSVC 纯静态库 (lib + header)
             - FFmpeg 版本/分支: ${{ steps.set_ref.outputs.ffmpeg_ref }}
           files: ffmpeg-wasapi-hwenc-msvc2022-x64.zip
           draft: false
