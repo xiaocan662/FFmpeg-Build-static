@@ -1,6 +1,5 @@
 name: Build FFmpeg Static (MSVC2022 + NVENC/QSV/AMF + MT)
 
-# 保留手动触发，无自动push触发
 on:
   workflow_dispatch:
     inputs:
@@ -30,20 +29,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 加载 MSVC2022 x64 环境
       - name: Setup MSVC 2022 x64
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           toolset: 14.4
 
-      # 安装编译依赖
       - name: Install build tools
-        run: |
-          choco install nasm yasm perl git make --no-progress
-          refreshenv
+        run: choco install nasm yasm perl git make --no-progress && refreshenv
 
-      # 解析 FFmpeg 分支
       - name: Resolve FFmpeg ref
         id: set_ref
         shell: pwsh
@@ -56,59 +50,26 @@ jobs:
           }
           echo "ffmpeg_ref=$target_ref" >> $env:GITHUB_OUTPUT
 
-      # 创建D盘目录、临时目录，清理旧文件
       - name: Prepare directories
-        run: |
-          if not exist "%D_WORK_ROOT%" mkdir "%D_WORK_ROOT%"
-          if not exist "%TMP%" mkdir "%TMP%"
-          if exist "%FFMPEG_PREFIX%" rmdir /s /q "%FFMPEG_PREFIX%"
-          cd /d "%D_WORK_ROOT%"
+        run: if not exist "%D_WORK_ROOT%" mkdir "%D_WORK_ROOT%" && if not exist "%TMP%" mkdir "%TMP%" && if exist "%FFMPEG_PREFIX%" rmdir /s /q "%FFMPEG_PREFIX%" && cd /d "%D_WORK_ROOT%"
 
-      # 拉取 FFmpeg 源码
       - name: Clone FFmpeg source
-        run: |
-          git clone --depth 1 --branch ${{ steps.set_ref.outputs.ffmpeg_ref }} https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
+        run: git clone --depth 1 --branch ${{ steps.set_ref.outputs.ffmpeg_ref }} https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
 
-      # 核心配置：解决 cl.exe 检测失败 + MT 运行时
       - name: Configure FFmpeg
         working-directory: %D_WORK_ROOT%\ffmpeg-src
-        run: |
-          set "CFLAGS="
-          set "CXXFLAGS="
-          set "LDFLAGS=-MT"
-          ./configure --toolchain=msvc ^
-          --enable-cross-compile ^
-          --enable-static ^
-          --disable-shared ^
-          --enable-nvenc ^
-          --enable-libmfx ^
-          --enable-amf ^
-          --enable-d3d11va ^
-          --enable-dxva2 ^
-          --disable-programs ^
-          --disable-ffmpeg ^
-          --disable-ffplay ^
-          --disable-ffprobe ^
-          --disable-doc ^
-          --disable-debug ^
-          --enable-runtime-cpudetect ^
-          --prefix=%FFMPEG_PREFIX%
+        run: set "CFLAGS=" && set "CXXFLAGS=" && set "LDFLAGS=-MT" && ./configure --toolchain=msvc --enable-cross-compile --enable-static --disable-shared --enable-nvenc --enable-libmfx --enable-amf --enable-d3d11va --enable-dxva2 --disable-programs --disable-ffmpeg --disable-ffplay --disable-ffprobe --disable-doc --disable-debug --enable-runtime-cpudetect --prefix=%FFMPEG_PREFIX%
 
-      # 编译 & 安装
       - name: Build and Install
         working-directory: %D_WORK_ROOT%\ffmpeg-src
-        run: |
-          make -j%NUMBER_OF_PROCESSORS%
-          make install
+        run: make -j%NUMBER_OF_PROCESSORS% && make install
 
-      # 打包压缩
       - name: Archive output files
         shell: pwsh
         run: |
           $zipPath = Join-Path "${{ github.workspace }}" "ffmpeg-msvc2022-x64-static.zip"
           Compress-Archive -Path "${{ env.FFMPEG_PREFIX }}\*" -DestinationPath $zipPath -Force
 
-      # 上传制品
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -116,7 +77,6 @@ jobs:
           path: ffmpeg-msvc2022-x64-static.zip
           retention-days: 30
 
-      # 创建 Git 标签
       - name: Create Git Tag
         shell: pwsh
         run: |
@@ -126,7 +86,6 @@ jobs:
           git tag -f $tag
           git push origin -f $tag
 
-      # 发布 Release
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
