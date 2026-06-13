@@ -1,198 +1,180 @@
-# .github/workflows/build-ffmpeg-msvc-full.yml
-name: Build FFmpeg static libs (MSVC MT, HW encoders + WASAPI)
+name: Build FFmpeg with MSVC 2022 (MT, Static Libs, Hardware Encoders)
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'FFmpeg version tag (e.g., n6.0), leave empty for latest'
+      ffmpeg_version:
+        description: 'FFmpeg version (tag, branch or commit hash). Leave empty for latest stable release'
         required: false
         default: ''
+        type: string
 
-permissions:
-  contents: write
+env:
+  # 安装目录
+  INSTALL_DIR: ${{ github.workspace }}/ffmpeg-install
+  # 依赖 SDK 存放目录
+  DEPS_DIR: ${{ github.workspace }}/deps
+  # 最终打包文件名
+  ARTIFACT_NAME: ffmpeg-static-libs-${{ github.run_number }}
 
 jobs:
   build:
     runs-on: windows-2022
-
     steps:
-      - name: Checkout
+      - name: Checkout (only for scripts, not FFmpeg)
         uses: actions/checkout@v4
-
-      - name: Setup NASM
-        uses: ilammy/setup-nasm@v1
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MSYS
+          msystem: UCRT64
+          update: true
           install: >-
+            base-devel
+            git
             make
-            pkg-config
             diffutils
-          update: false
+            unzip
+            wget
+            tar
 
-      - name: Cache vcpkg packages
-        uses: actions/cache@v4
+      - name: Setup Visual Studio environment variables (for MSVC)
+        uses: ilammy/msvc-dev-cmd@v1
         with:
-          path: C:\vcpkg\installed
-          key: vcpkg-x64-windows-static-full-${{ hashFiles('.github/workflows/build-ffmpeg-msvc-full.yml') }}
-          restore-keys: |
-            vcpkg-x64-windows-static-full-
+          arch: x64
 
-      - name: Install base dependencies via vcpkg
+      - name: Prepare directories
+        run: |
+          mkdir ${{ env.DEPS_DIR }}
+          mkdir ${{ env.INSTALL_DIR }}
+          mkdir ${{ env.INSTALL_DIR }}/include
+          mkdir ${{ env.INSTALL_DIR }}/lib
+
+      - name: Download and install NVIDIA NVENC SDK
+        run: |
+          cd ${{ env.DEPS_DIR }}
+          curl -L -o nv-codec-headers.zip https://github.com/FFmpeg/nv-codec-headers/releases/download/n12.0.16.0/nv-codec-headers-12.0.16.0.tar.gz
+          tar -xzf nv-codec-headers.zip
+          # 实际上只需要头文件，复制到 MSVC 搜索路径
+          xcopy /E /I nv-codec-headers-12.0.16.0/include ${{ env.INSTALL_DIR }}/include\
+
+      - name: Download and install Intel oneVPL (QSV)
+        run: |
+          cd ${{ env.DEPS_DIR }}
+          curl -L -o oneVPL.zip https://github.com/oneapi-src/oneVPL/archive/refs/tags/v2024.0.0.zip
+          unzip oneVPL.zip
+          cd oneVPL-2024.0.0
+          # 使用 CMake 构建安装库和头文件（静态库）
+          mkdir build && cd build
+          cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_INSTALL_PREFIX=${{ env.INSTALL_DIR }} -DBUILD_SHARED_LIBS=OFF
+          cmake --build . --config Release --target install
+
+      - name: Download and install AMD AMF SDK
+        run: |
+          cd ${{ env.DEPS_DIR }}
+          curl -L -o AMF.zip https://github.com/GPUOpen-LibrariesAndSDKs/AMF/archive/refs/heads/master.zip
+          unzip AMF.zip
+          xcopy /E /I AMF-master/amf/public/include ${{ env.INSTALL_DIR }}/include\AMF\
+
+      # 可选：下载其他常用编码库（x264, x265），由于编译耗时，此处省略，但可根据需要启用
+      # 如需 libx264，需要额外编译或使用预编译包；本例重点展示硬件编码
+
+      - name: Get FFmpeg source code
+        shell: msys2 {0}
+        run: |
+          cd ${{ github.workspace }}
+          if [ -z "${{ inputs.ffmpeg_version }}" ]; then
+            # 获取最新的稳定版 tag
+            echo "No version specified, fetching latest stable release..."
+            git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+            cd ffmpeg-src
+            LATEST_TAG=$(git ls-remote --tags --sort=v:refname https://github.com/FFmpeg/FFmpeg.git | grep -E 'refs/tags/n[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 | sed 's/.*refs\/tags\///')
+            echo "Latest stable tag: $LATEST_TAG"
+            git checkout $LATEST_TAG
+          else
+            echo "Cloning specific version: ${{ inputs.ffmpeg_version }}"
+            git clone --branch ${{ inputs.ffmpeg_version }} --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          fi
+
+      - name: Configure FFmpeg (MSVC, MT runtime, static libraries, hardware encoders)
+        shell: msys2 {0}
+        run: |
+          cd ${{ github.workspace }}/ffmpeg-src
+          # 设置编译标志强制 /MT
+          export CFLAGS="/MT"
+          export CXXFLAGS="/MT"
+          # 设置额外头文件和库路径
+          export PKG_CONFIG_PATH="${{ env.INSTALL_DIR }}/lib/pkgconfig"
+          ./configure \
+            --toolchain=msvc \
+            --arch=x86_64 \
+            --enable-static \
+            --disable-shared \
+            --disable-programs \
+            --disable-doc \
+            --prefix=${{ env.INSTALL_DIR }} \
+            --extra-cflags="-I${{ env.INSTALL_DIR }}/include -I${{ env.INSTALL_DIR }}/include/AMF /MT" \
+            --extra-ldflags="-LIBPATH:${{ env.INSTALL_DIR }}/lib" \
+            --enable-nvenc \
+            --enable-qsv \
+            --enable-amf \
+            --enable-dxva2 \
+            --enable-ffnvcodec \
+            --enable-libvpl \
+            --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc \
+            --enable-encoder=h264_qsv,hevc_qsv \
+            --enable-encoder=h264_amf,hevc_amf \
+            --enable-decoder=h264_cuvid,hevc_cuvid \
+            --enable-hwaccel=h264_dxva2,hevc_dxva2
+
+      - name: Compile FFmpeg
+        shell: msys2 {0}
+        run: |
+          cd ${{ github.workspace }}/ffmpeg-src
+          make -j$(nproc)
+
+      - name: Install FFmpeg (headers + static libs)
+        shell: msys2 {0}
+        run: |
+          cd ${{ github.workspace }}/ffmpeg-src
+          make install
+
+      - name: Package static libraries and headers
+        run: |
+          cd ${{ env.INSTALL_DIR }}
+          # 只打包 lib 和 include 目录（排除 .dll 和 .exe）
+          7z a ${{ github.workspace }}/ffmpeg-libs.zip ./include ./lib
         shell: pwsh
+
+      - name: Determine release version tag
+        id: get_version
+        shell: msys2 {0}
         run: |
-          vcpkg install --triplet x64-windows-static `
-            zlib bzip2 liblzma libiconv `
-            libpng libjpeg-turbo tiff libwebp `
-            freetype harfbuzz fribidi libass `
-            libogg libvorbis libtheora opus speex `
-            libvpx x264 x265 lame openjpeg soxr
+          cd ${{ github.workspace }}/ffmpeg-src
+          if [ -n "${{ inputs.ffmpeg_version }}" ]; then
+            VERSION="${{ inputs.ffmpeg_version }}"
+          else
+            # 从 git 获取当前 checkout 的 tag 名称
+            VERSION=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)
+          fi
+          # 移除版本号前导 'n' 或 'v' 并格式化
+          TAG_NAME="ffmpeg-${VERSION#n}"
+          echo "VERSION_TAG=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "RELEASE_NAME=FFmpeg Static Libs (MT) - ${VERSION#n}" >> $GITHUB_OUTPUT
 
-          $pkgConfigPath = "C:\vcpkg\installed\x64-windows-static\lib\pkgconfig"
-          Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG_PATH=$pkgConfigPath"
-
-      - name: Setup NVENC headers
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/FFmpeg/nv-codec-headers.git
-          cd nv-codec-headers
-          make install PREFIX=$(pwd)/../nv-install
-          cd ..
-          echo "PKG_CONFIG_PATH=$(pwd)/nv-install/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
-
-      - name: Setup AMF headers
-        shell: pwsh
-        run: |
-          git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
-          $amfInclude = "$(Get-Location)\AMF\amf\public\include"
-          Add-Content -Path $env:GITHUB_ENV -Value "AMF_CFLAGS=-I$amfInclude"
-
-      - name: Try to setup Intel VPL (QSV)
-        id: qsv
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          vcpkg install intel-vpl --triplet x64-windows-static
-          $vplPkgConfig = "C:\vcpkg\installed\x64-windows-static\lib\pkgconfig"
-          $env:PKG_CONFIG_PATH = "$vplPkgConfig;$env:PKG_CONFIG_PATH"
-          # Check if libvpl.pc exists
-          if (Test-Path "$vplPkgConfig\vpl.pc") {
-            Write-Host "Intel VPL found, QSV will be enabled"
-            "PKG_CONFIG_PATH=$vplPkgConfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
-            "ENABLE_QSV=yes" >> $env:GITHUB_ENV
-          } else {
-            Write-Warning "Intel VPL not available, QSV will be disabled"
-          }
-
-      - name: Clone FFmpeg
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrEmpty('${{ github.event.inputs.version }}')) {
-            git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg_src
-            Push-Location ffmpeg_src
-            git fetch --tags --depth 1
-            $latestTag = git describe --tags $(git rev-list --tags --max-count=1) 2>$null
-            if ($latestTag) {
-              git checkout $latestTag
-              Write-Host "Building latest release: $latestTag"
-            } else {
-              Write-Host "No tags found, using master"
-            }
-            Pop-Location
-            Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=latest"
-          } else {
-            git clone --depth 1 --branch ${{ github.event.inputs.version }} https://github.com/FFmpeg/FFmpeg.git ffmpeg_src
-            Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=${{ github.event.inputs.version }}"
-          }
-
-      - name: Configure and build FFmpeg
-        shell: pwsh
-        run: |
-          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64
-
-          Set-Location ffmpeg_src
-
-          # Base configuration
-          $confArgs = @'
-            --toolchain=msvc
-            --prefix=./install
-            --enable-static
-            --disable-shared
-            --disable-doc
-            --arch=x86_64
-            --target-os=win64
-            --extra-cflags="-MT -D_USE_MATH_DEFINES"
-            --extra-ldflags="-NODEFAULTLIB:MSVCRT"
-            --enable-gpl
-            --enable-version3
-            --enable-nonfree
-            --enable-wasapi
-            --enable-libx264
-            --enable-libx265
-            --enable-libvpx
-            --enable-libopus
-            --enable-libvorbis
-            --enable-libtheora
-            --enable-libspeex
-            --enable-libmp3lame
-            --enable-libwebp
-            --enable-libass
-            --enable-libfreetype
-            --enable-libfribidi
-            --enable-libzlib
-            --enable-libbz2
-            --enable-liblzma
-            --enable-libpng
-            --enable-libopenjpeg
-            --enable-libsoxr
-            --enable-iconv
-          '@ -replace "`r`n", " " -replace '\s+', ' '
-
-          # Add NVENC
-          $confArgs += " --enable-ffnvcodec --enable-nvenc"
-
-          # Add AMF (if header path is set)
-          if ($env:AMF_CFLAGS) {
-            $confArgs += " --enable-amf --extra-cflags=`"$env:AMF_CFLAGS`""
-            Write-Host "AMF enabled"
-          }
-
-          # Add QSV if VPL was found
-          if ($env:ENABLE_QSV -eq 'yes') {
-            $confArgs += " --enable-libvpl"
-            Write-Host "QSV enabled via Intel VPL"
-          } else {
-            Write-Host "QSV not available, skipping"
-          }
-
-          Write-Host "Configure arguments:"
-          Write-Host $confArgs
-
-          # Pass to bash for configure
-          bash -c "./configure $confArgs"
-          if ($LASTEXITCODE -ne 0) { throw "Configure failed" }
-
-          bash -c 'make -j$(nproc) && make install'
-          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
-
-      - name: Package artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path ffmpeg-build
-          Copy-Item -Path ffmpeg_src/install/* -Destination ffmpeg-build/ -Recurse
-          Compress-Archive -Path ffmpeg-build/* -DestinationPath ffmpeg-windows-x64-msvc-mt-hw.zip
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Create GitHub Release and upload artifact
+        uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ env.TAG_NAME }}
-          name: FFmpeg static libs ${{ env.TAG_NAME }}
-          files: ffmpeg-windows-x64-msvc-mt-hw.zip
+          tag_name: ${{ steps.get_version.outputs.VERSION_TAG }}
+          name: ${{ steps.get_version.outputs.RELEASE_NAME }}
+          body: |
+            FFmpeg static libraries compiled with MSVC 2022.
+            - Runtime: **/MT** (statically linked CRT)
+            - Hardware encoders: NVENC, Intel QSV (oneVPL), AMF
+            - Static libraries only (`.lib`)
+            - Includes headers and libs
+          files: ${{ github.workspace }}/ffmpeg-libs.zip
           draft: false
           prerelease: false
-          make_latest: ${{ env.TAG_NAME == 'latest' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
