@@ -58,22 +58,23 @@ jobs:
           set CFLAGS=-MT
           set CXXFLAGS=-MT
           set LDFLAGS=-MT
-          ./configure --toolchain=msvc ^
-            --enable-static ^
-            --disable-shared ^
-            --enable-wasapi ^
-            --enable-nvenc ^
-            --enable-qsv ^
-            --enable-amf ^
-            --enable-d3d11va ^
-            --enable-dxva2 ^
-            --disable-programs ^
-            --disable-ffmpeg ^
-            --disable-ffplay ^
-            --disable-ffprobe ^
-            --disable-doc ^
-            --disable-debug ^
-            --enable-runtime-cpudetect ^
+          ./configure `
+            --toolchain=msvc `
+            --enable-static `
+            --disable-shared `
+            --enable-wasapi `
+            --enable-nvenc `
+            --enable-qsv `
+            --enable-amf `
+            --enable-d3d11va `
+            --enable-dxva2 `
+            --disable-programs `
+            --disable-ffmpeg `
+            --disable-ffplay `
+            --disable-ffprobe `
+            --disable-doc `
+            --disable-debug `
+            --enable-runtime-cpudetect `
             --prefix=${{ env.FFMPEG_PREFIX }}
 
       - name: Build & Install FFmpeg
