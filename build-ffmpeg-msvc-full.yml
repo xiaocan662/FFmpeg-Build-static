@@ -1,0 +1,198 @@
+# .github/workflows/build-ffmpeg-msvc-full.yml
+name: Build FFmpeg static libs (MSVC MT, HW encoders + WASAPI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'FFmpeg version tag (e.g., n6.0), leave empty for latest'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          install: >-
+            make
+            pkg-config
+            diffutils
+          update: false
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-x64-windows-static-full-${{ hashFiles('.github/workflows/build-ffmpeg-msvc-full.yml') }}
+          restore-keys: |
+            vcpkg-x64-windows-static-full-
+
+      - name: Install base dependencies via vcpkg
+        shell: pwsh
+        run: |
+          vcpkg install --triplet x64-windows-static `
+            zlib bzip2 liblzma libiconv `
+            libpng libjpeg-turbo tiff libwebp `
+            freetype harfbuzz fribidi libass `
+            libogg libvorbis libtheora opus speex `
+            libvpx x264 x265 lame openjpeg soxr
+
+          $pkgConfigPath = "C:\vcpkg\installed\x64-windows-static\lib\pkgconfig"
+          Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG_PATH=$pkgConfigPath"
+
+      - name: Setup NVENC headers
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/FFmpeg/nv-codec-headers.git
+          cd nv-codec-headers
+          make install PREFIX=$(pwd)/../nv-install
+          cd ..
+          echo "PKG_CONFIG_PATH=$(pwd)/nv-install/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
+      - name: Setup AMF headers
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+          $amfInclude = "$(Get-Location)\AMF\amf\public\include"
+          Add-Content -Path $env:GITHUB_ENV -Value "AMF_CFLAGS=-I$amfInclude"
+
+      - name: Try to setup Intel VPL (QSV)
+        id: qsv
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          vcpkg install intel-vpl --triplet x64-windows-static
+          $vplPkgConfig = "C:\vcpkg\installed\x64-windows-static\lib\pkgconfig"
+          $env:PKG_CONFIG_PATH = "$vplPkgConfig;$env:PKG_CONFIG_PATH"
+          # Check if libvpl.pc exists
+          if (Test-Path "$vplPkgConfig\vpl.pc") {
+            Write-Host "Intel VPL found, QSV will be enabled"
+            "PKG_CONFIG_PATH=$vplPkgConfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
+            "ENABLE_QSV=yes" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "Intel VPL not available, QSV will be disabled"
+          }
+
+      - name: Clone FFmpeg
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty('${{ github.event.inputs.version }}')) {
+            git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg_src
+            Push-Location ffmpeg_src
+            git fetch --tags --depth 1
+            $latestTag = git describe --tags $(git rev-list --tags --max-count=1) 2>$null
+            if ($latestTag) {
+              git checkout $latestTag
+              Write-Host "Building latest release: $latestTag"
+            } else {
+              Write-Host "No tags found, using master"
+            }
+            Pop-Location
+            Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=latest"
+          } else {
+            git clone --depth 1 --branch ${{ github.event.inputs.version }} https://github.com/FFmpeg/FFmpeg.git ffmpeg_src
+            Add-Content -Path $env:GITHUB_ENV -Value "TAG_NAME=${{ github.event.inputs.version }}"
+          }
+
+      - name: Configure and build FFmpeg
+        shell: pwsh
+        run: |
+          & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64
+
+          Set-Location ffmpeg_src
+
+          # Base configuration
+          $confArgs = @'
+            --toolchain=msvc
+            --prefix=./install
+            --enable-static
+            --disable-shared
+            --disable-doc
+            --arch=x86_64
+            --target-os=win64
+            --extra-cflags="-MT -D_USE_MATH_DEFINES"
+            --extra-ldflags="-NODEFAULTLIB:MSVCRT"
+            --enable-gpl
+            --enable-version3
+            --enable-nonfree
+            --enable-wasapi
+            --enable-libx264
+            --enable-libx265
+            --enable-libvpx
+            --enable-libopus
+            --enable-libvorbis
+            --enable-libtheora
+            --enable-libspeex
+            --enable-libmp3lame
+            --enable-libwebp
+            --enable-libass
+            --enable-libfreetype
+            --enable-libfribidi
+            --enable-libzlib
+            --enable-libbz2
+            --enable-liblzma
+            --enable-libpng
+            --enable-libopenjpeg
+            --enable-libsoxr
+            --enable-iconv
+          '@ -replace "`r`n", " " -replace '\s+', ' '
+
+          # Add NVENC
+          $confArgs += " --enable-ffnvcodec --enable-nvenc"
+
+          # Add AMF (if header path is set)
+          if ($env:AMF_CFLAGS) {
+            $confArgs += " --enable-amf --extra-cflags=`"$env:AMF_CFLAGS`""
+            Write-Host "AMF enabled"
+          }
+
+          # Add QSV if VPL was found
+          if ($env:ENABLE_QSV -eq 'yes') {
+            $confArgs += " --enable-libvpl"
+            Write-Host "QSV enabled via Intel VPL"
+          } else {
+            Write-Host "QSV not available, skipping"
+          }
+
+          Write-Host "Configure arguments:"
+          Write-Host $confArgs
+
+          # Pass to bash for configure
+          bash -c "./configure $confArgs"
+          if ($LASTEXITCODE -ne 0) { throw "Configure failed" }
+
+          bash -c 'make -j$(nproc) && make install'
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path ffmpeg-build
+          Copy-Item -Path ffmpeg_src/install/* -Destination ffmpeg-build/ -Recurse
+          Compress-Archive -Path ffmpeg-build/* -DestinationPath ffmpeg-windows-x64-msvc-mt-hw.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: FFmpeg static libs ${{ env.TAG_NAME }}
+          files: ffmpeg-windows-x64-msvc-mt-hw.zip
+          draft: false
+          prerelease: false
+          make_latest: ${{ env.TAG_NAME == 'latest' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
