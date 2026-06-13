@@ -1,20 +1,22 @@
 name: Build FFmpeg Static (MSVC2022 + NVENC/QSV/AMF + MT)
-
 on:
   workflow_dispatch:
     inputs:
       ffmpeg_ref:
-        description: FFmpeg 版本/标签/分支 (留空 = master)
+        description: FFmpeg 版本/分支
         required: false
         type: string
       release_tag:
-        description: Release 标签名称
+        description: Release 标签
         default: ffmpeg-hwenc-static-latest
         type: string
 
 env:
   D_WORK_ROOT: D:\ffmpeg-build
   FFMPEG_PREFIX: D:\ffmpeg-build\ffmpeg-output
+  # 统一临时目录，避免系统临时盘权限/空间问题
+  TMP: D:\ffmpeg-build\tmp
+  TEMP: D:\ffmpeg-build\tmp
 
 jobs:
   build:
@@ -23,23 +25,23 @@ jobs:
       run:
         shell: cmd
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 加载 MSVC2022 编译环境
-      - name: Setup MSVC 2022
+      # 加载 MSVC x64 环境（必须在最前）
+      - name: Init MSVC 2022 x64
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           toolset: 14.4
 
-      # 安装依赖: nasm yasm perl git make
+      # 安装全套编译依赖
       - name: Install build tools
         run: |
           choco install nasm yasm perl git make --no-progress
           refreshenv
 
-      # 判定分支/版本
+      # 确定 FFmpeg 分支
       - name: Set FFmpeg ref
         id: set_ref
         shell: pwsh
@@ -50,21 +52,29 @@ jobs:
             echo "ffmpeg_ref=${{ github.event.inputs.ffmpeg_ref }}" >> $env:GITHUB_OUTPUT
           }
 
-      # 创建D盘目录 + 拉取源码
-      - name: Clone FFmpeg source
+      # 创建 D 盘目录 + 临时目录
+      - name: Prepare dirs
         run: |
           mkdir "%D_WORK_ROOT%"
+          mkdir "%TMP%"
+          rmdir /s /q "%FFMPEG_PREFIX%" 2>nul
           cd /d "%D_WORK_ROOT%"
+
+      # 拉取源码
+      - name: Clone FFmpeg
+        run: |
           git clone --depth 1 --branch ${{ steps.set_ref.outputs.ffmpeg_ref }} https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
 
-      # Configure 配置(CMD语法 + MSVC + MT)
+      # 配置：移除 CFLAGS 里的 -MT，仅 LDFLAGS 加 -MT
+      # 开启 --enable-cross-compile 适配 Windows MSVC 交叉检测告警
       - name: Configure FFmpeg
-        working-directory: ${{ env.D_WORK_ROOT }}\ffmpeg-src
+        working-directory: %D_WORK_ROOT%\ffmpeg-src
         run: |
-          set "CFLAGS=-MT"
-          set "CXXFLAGS=-MT"
+          set "CFLAGS="
+          set "CXXFLAGS="
           set "LDFLAGS=-MT"
           ./configure --toolchain=msvc ^
+          --enable-cross-compile ^
           --enable-static ^
           --disable-shared ^
           --enable-nvenc ^
@@ -81,21 +91,21 @@ jobs:
           --enable-runtime-cpudetect ^
           --prefix=%FFMPEG_PREFIX%
 
-      # 编译 + 安装
+      # 编译 & 安装
       - name: Build & Install
-        working-directory: ${{ env.D_WORK_ROOT }}\ffmpeg-src
+        working-directory: %D_WORK_ROOT%\ffmpeg-src
         run: |
           make -j%NUMBER_OF_PROCESSORS%
           make install
 
       # 打包
-      - name: Archive files
+      - name: Archive
         shell: pwsh
         run: |
           Compress-Archive -Path ${{ env.FFMPEG_PREFIX }}\* -DestinationPath ${{ github.workspace }}\ffmpeg-msvc2022-x64-static.zip -Force
 
       # 上传制品
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-static-libs
@@ -103,7 +113,7 @@ jobs:
           retention-days: 30
 
       # 创建标签
-      - name: Create Git Tag
+      - name: Create Tag
         shell: pwsh
         run: |
           $tag = "${{ github.event.inputs.release_tag }}"
@@ -119,14 +129,13 @@ jobs:
           tag_name: ${{ github.event.inputs.release_tag }}
           name: FFmpeg Static (MSVC2022 x64 + 硬件编解码 + MT)
           body: |
-            ## 编译信息
-            - 编译器: MSVC 2022 (v14.4)
-            - 架构: x64
-            - 运行时: MT 静态多线程运行时
-            - 硬件编码: NVENC / QSV(libmfx) / AMF
-            - 硬件解码: D3D11VA / DXVA2
-            - 音频: 原生支持 WASAPI(avdevice)
-            - 输出: MSVC 纯静态库
+            编译信息
+            - 编译器: MSVC 2022 v14.4 x64
+            - 运行时: MT 静态运行时库
+            - 编码: NVENC / QSV(libmfx) / AMF
+            - 解码: D3D11VA / DXVA2
+            - 音频: 原生支持 WASAPI
+            - 架构: x64 纯静态库
             - FFmpeg 版本: ${{ steps.set_ref.outputs.ffmpeg_ref }}
           files: ffmpeg-msvc2022-x64-static.zip
           draft: false
