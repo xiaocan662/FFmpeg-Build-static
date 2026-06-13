@@ -1,0 +1,138 @@
+name: Build FFmpeg Static (MSVC2022 + WASAPI + NVENC/QSV/AMF + MT)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: FFmpeg 版本/标签/分支 (留空 = 拉取最新 master 主干)
+        required: false
+        type: string
+      release_tag:
+        description: Release 标签名称
+        default: ffmpeg-wasapi-hwenc-static-latest
+        type: string
+  push:
+    branches: [ main ]
+
+env:
+  TARGET_ARCH: x64
+  BUILD_TYPE: Release
+  MSVC_RUNTIME: MultiThreaded
+  # D盘工作根目录
+  D_WORK_ROOT: D:\ffmpeg-build
+  # FFmpeg 安装输出目录（D盘）
+  FFMPEG_PREFIX: D:\ffmpeg-build\ffmpeg-output
+  FFMPEG_EXTRA_FLAGS: >
+    --enable-static
+    --disable-shared
+    --enable-wasapi
+    --enable-nvenc
+    --enable-qsv
+    --enable-amf
+    --enable-d3d11va
+    --enable-dxva2
+    --disable-programs
+    --disable-ffmpeg
+    --disable-ffplay
+    --disable-ffprobe
+    --disable-doc
+    --disable-debug
+    --enable-runtime-cpudetect
+    --prefix=${{ env.FFMPEG_PREFIX }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 加载 MSVC2022 编译环境（保留C盘默认）
+      - name: Setup MSVC 2022
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ env.TARGET_ARCH }}
+          toolset: 14.4
+
+      # 安装编译依赖（C盘）
+      - name: Install build dependencies
+        run: |
+          choco install nasm yasm perl git --no-progress
+          refreshenv
+
+      # 判定分支/版本
+      - name: Set FFmpeg checkout ref
+        id: set_ref
+        run: |
+          if ("${{ github.event.inputs.ffmpeg_ref }}" -eq "") {
+            echo "ffmpeg_ref=master" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "ffmpeg_ref=${{ github.event.inputs.ffmpeg_ref }}" >> $env:GITHUB_OUTPUT
+          }
+
+      # 创建 D 盘目录 & 拉取 FFmpeg 源码到 D盘
+      - name: Clone FFmpeg source to D drive
+        run: |
+          mkdir ${{ env.D_WORK_ROOT }} -Force
+          cd ${{ env.D_WORK_ROOT }}
+          git clone --depth 1 --branch ${{ steps.set_ref.outputs.ffmpeg_ref }} https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
+
+      # 配置 MT 静态运行时 + 硬件编码（工作目录D盘源码）
+      - name: Configure FFmpeg
+        working-directory: ${{ env.D_WORK_ROOT }}\ffmpeg-src
+        run: |
+          set CFLAGS=-MT
+          set CXXFLAGS=-MT
+          set LDFLAGS=-MT
+          ./configure --toolchain=msvc ${{ env.FFMPEG_EXTRA_FLAGS }}
+
+      # 编译 & 安装
+      - name: Build & Install FFmpeg
+        working-directory: ${{ env.D_WORK_ROOT }}\ffmpeg-src
+        run: |
+          make -j%NUMBER_OF_PROCESSORS% V=1
+          make install V=1
+
+      # D盘打包，压缩包放回 GitHub 工作区(C盘)用于上传
+      - name: Archive build artifacts
+        run: |
+          Compress-Archive -Path ${{ env.FFMPEG_PREFIX }}\* -DestinationPath ${{ github.workspace }}\ffmpeg-wasapi-hwenc-msvc2022-x64.zip
+
+      # 上传制品备份
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-static-hw-libs
+          path: ffmpeg-wasapi-hwenc-msvc2022-x64.zip
+          retention-days: 30
+
+      # 创建 Git 标签
+      - name: Create Git Tag
+        run: |
+          $tag = "${{ github.event.inputs.release_tag }}"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git tag -f $tag
+          git push origin -f $tag
+
+      # 自动发布 Release
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: FFmpeg Static (MSVC2022 x64 + WASAPI + 全硬件编码 + MT)
+          body: |
+            ## 编译信息
+            - 编译器: MSVC 2022 (v14.4)
+            - 架构: x64
+            - 运行时: MT 静态多线程运行时库
+            - 音频: 启用 WASAPI
+            - 硬件编码: NVENC(N卡) / QSV(I卡) / AMF(A卡)
+            - 硬件解码: D3D11VA / DXVA2
+            - 类型: 纯静态库（仅头文件+lib，无可执行程序）
+            - FFmpeg 版本/分支: ${{ steps.set_ref.outputs.ffmpeg_ref }}
+          files: ffmpeg-wasapi-hwenc-msvc2022-x64.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
