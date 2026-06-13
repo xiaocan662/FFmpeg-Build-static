@@ -9,7 +9,7 @@ on:
         type: string
       release_tag:
         description: Release 标签名称
-        default: ffmpeg-wasapi-hwenc-static-latest
+        default: ffmpeg-hwenc-static-latest
         type: string
 
 env:
@@ -65,7 +65,7 @@ jobs:
             --enable-static \
             --disable-shared \
             --enable-nvenc \
-            --enable-qsv \
+            --enable-libmfx \
             --enable-amf \
             --enable-d3d11va \
             --enable-dxva2 \
@@ -88,13 +88,13 @@ jobs:
       - name: Archive artifacts
         shell: pwsh
         run: |
-          Compress-Archive -Path ${{ env.FFMPEG_PREFIX }}\* -DestinationPath ${{ github.workspace }}\ffmpeg-wasapi-hwenc-msvc2022-x64.zip -Force
+          Compress-Archive -Path ${{ env.FFMPEG_PREFIX }}\* -DestinationPath ${{ github.workspace }}\ffmpeg-msvc2022-x64-static.zip -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-static-hw-libs
-          path: ffmpeg-wasapi-hwenc-msvc2022-x64.zip
+          name: ffmpeg-static-libs
+          path: ffmpeg-msvc2022-x64-static.zip
           retention-days: 30
 
       - name: Create Git Tag
@@ -110,18 +110,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag }}
-          name: FFmpeg Static (MSVC2022 x64 + WASAPI + 全硬件编码 + MT)
+          name: FFmpeg Static (MSVC2022 x64 + 硬件编解码 + MT)
           body: |
             ## 编译信息
             - 编译器: MSVC 2022 (v14.4)
             - 架构: x64
             - 运行时: MT 静态多线程运行时库
-            - 音频: 原生支持 WASAPI (avdevice)
-            - 硬件编码: NVENC / QSV / AMF
+            - 音频: 原生支持 WASAPI(avdevice)
+            - 硬件编码: NVENC(N卡) / QSV(I卡,libmfx) / AMF(A卡)
             - 硬件解码: D3D11VA / DXVA2
             - 类型: MSVC 纯静态库 (lib + header)
             - FFmpeg 版本/分支: ${{ steps.set_ref.outputs.ffmpeg_ref }}
-          files: ffmpeg-wasapi-hwenc-msvc2022-x64.zip
+          files: ffmpeg-msvc2022-x64-static.zip
           draft: false
           prerelease: false
         env:
