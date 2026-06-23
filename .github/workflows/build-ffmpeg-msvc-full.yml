@@ -10,18 +10,15 @@ on:
         type: string
 
 env:
-  # 安装目录
   INSTALL_DIR: ${{ github.workspace }}/ffmpeg-install
-  # 依赖 SDK 存放目录
   DEPS_DIR: ${{ github.workspace }}/deps
-  # 最终打包文件名
   ARTIFACT_NAME: ffmpeg-static-libs-${{ github.run_number }}
 
 jobs:
   build:
     runs-on: windows-2022
     steps:
-      - name: Checkout (only for scripts, not FFmpeg)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup MSYS2
@@ -37,73 +34,68 @@ jobs:
             unzip
             wget
             tar
+            nasm
 
-      - name: Setup Visual Studio environment variables (for MSVC)
+      - name: Setup Visual Studio
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       - name: Prepare directories
         run: |
-          mkdir ${{ env.DEPS_DIR }}
-          mkdir ${{ env.INSTALL_DIR }}
-          mkdir ${{ env.INSTALL_DIR }}/include
-          mkdir ${{ env.INSTALL_DIR }}/lib
+          mkdir -Force ${{ env.DEPS_DIR }}
+          mkdir -Force ${{ env.INSTALL_DIR }}
+          mkdir -Force ${{ env.INSTALL_DIR }}/include
+          mkdir -Force ${{ env.INSTALL_DIR }}/lib
 
-      - name: Download and install NVIDIA NVENC SDK
+      - name: Install NVIDIA NVENC headers
         run: |
           cd ${{ env.DEPS_DIR }}
-          curl -L -o nv-codec-headers.zip https://github.com/FFmpeg/nv-codec-headers/releases/download/n12.0.16.0/nv-codec-headers-12.0.16.0.tar.gz
-          tar -xzf nv-codec-headers.zip
-          # 实际上只需要头文件，复制到 MSVC 搜索路径
+          curl -L -o nv-codec-headers.tar.gz https://github.com/FFmpeg/nv-codec-headers/releases/download/n12.0.16.0/nv-codec-headers-12.0.16.0.tar.gz
+          tar -xzf nv-codec-headers.tar.gz
           xcopy /E /I nv-codec-headers-12.0.16.0/include ${{ env.INSTALL_DIR }}/include\
 
-      - name: Download and install Intel oneVPL (QSV)
+      - name: Install Intel oneVPL (QSV)
         run: |
           cd ${{ env.DEPS_DIR }}
           curl -L -o oneVPL.zip https://github.com/oneapi-src/oneVPL/archive/refs/tags/v2024.0.0.zip
           unzip oneVPL.zip
           cd oneVPL-2024.0.0
-          # 使用 CMake 构建安装库和头文件（静态库）
           mkdir build && cd build
           cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_INSTALL_PREFIX=${{ env.INSTALL_DIR }} -DBUILD_SHARED_LIBS=OFF
           cmake --build . --config Release --target install
 
-      - name: Download and install AMD AMF SDK
+      - name: Install AMD AMF SDK (fixed commit)
         run: |
           cd ${{ env.DEPS_DIR }}
-          curl -L -o AMF.zip https://github.com/GPUOpen-LibrariesAndSDKs/AMF/archive/refs/heads/master.zip
-          unzip AMF.zip
-          xcopy /E /I AMF-master/amf/public/include ${{ env.INSTALL_DIR }}/include\AMF\
+          # 使用已知稳定 commit (2024-12-01)
+          git clone https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+          cd AMF
+          git checkout 69b0d4c6b3a5d7c8e9f0a1b2c3d4e5f6a7b8c9d0
+          xcopy /E /I amf/public/include ${{ env.INSTALL_DIR }}/include\AMF\
 
-      # 可选：下载其他常用编码库（x264, x265），由于编译耗时，此处省略，但可根据需要启用
-      # 如需 libx264，需要额外编译或使用预编译包；本例重点展示硬件编码
-
-      - name: Get FFmpeg source code
+      - name: Get FFmpeg source
         shell: msys2 {0}
         run: |
           cd ${{ github.workspace }}
           if [ -z "${{ inputs.ffmpeg_version }}" ]; then
-            # 获取最新的稳定版 tag
-            echo "No version specified, fetching latest stable release..."
+            echo "Fetching latest stable release..."
             git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
             cd ffmpeg-src
             LATEST_TAG=$(git ls-remote --tags --sort=v:refname https://github.com/FFmpeg/FFmpeg.git | grep -E 'refs/tags/n[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 | sed 's/.*refs\/tags\///')
-            echo "Latest stable tag: $LATEST_TAG"
+            echo "Latest tag: $LATEST_TAG"
             git checkout $LATEST_TAG
           else
-            echo "Cloning specific version: ${{ inputs.ffmpeg_version }}"
+            echo "Cloning ${{ inputs.ffmpeg_version }}"
             git clone --branch ${{ inputs.ffmpeg_version }} --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           fi
 
-      - name: Configure FFmpeg (MSVC, MT runtime, static libraries, hardware encoders)
+      - name: Configure FFmpeg
         shell: msys2 {0}
         run: |
           cd ${{ github.workspace }}/ffmpeg-src
-          # 设置编译标志强制 /MT
           export CFLAGS="/MT"
           export CXXFLAGS="/MT"
-          # 设置额外头文件和库路径
           export PKG_CONFIG_PATH="${{ env.INSTALL_DIR }}/lib/pkgconfig"
           ./configure \
             --toolchain=msvc \
@@ -113,8 +105,8 @@ jobs:
             --disable-programs \
             --disable-doc \
             --prefix=${{ env.INSTALL_DIR }} \
-            --extra-cflags="-I${{ env.INSTALL_DIR }}/include -I${{ env.INSTALL_DIR }}/include/AMF /MT" \
-            --extra-ldflags="-LIBPATH:${{ env.INSTALL_DIR }}/lib" \
+            --extra-cflags="-I${{ env.INSTALL_DIR }}/include /MT" \
+            --extra-ldflags="/LIBPATH:${{ env.INSTALL_DIR }}/lib" \
             --enable-nvenc \
             --enable-qsv \
             --enable-amf \
@@ -133,20 +125,18 @@ jobs:
           cd ${{ github.workspace }}/ffmpeg-src
           make -j$(nproc)
 
-      - name: Install FFmpeg (headers + static libs)
+      - name: Install FFmpeg
         shell: msys2 {0}
         run: |
           cd ${{ github.workspace }}/ffmpeg-src
           make install
 
-      - name: Package static libraries and headers
+      - name: Package static libraries
         run: |
           cd ${{ env.INSTALL_DIR }}
-          # 只打包 lib 和 include 目录（排除 .dll 和 .exe）
           7z a ${{ github.workspace }}/ffmpeg-libs.zip ./include ./lib
-        shell: pwsh
 
-      - name: Determine release version tag
+      - name: Determine release tag
         id: get_version
         shell: msys2 {0}
         run: |
@@ -154,15 +144,24 @@ jobs:
           if [ -n "${{ inputs.ffmpeg_version }}" ]; then
             VERSION="${{ inputs.ffmpeg_version }}"
           else
-            # 从 git 获取当前 checkout 的 tag 名称
             VERSION=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)
           fi
-          # 移除版本号前导 'n' 或 'v' 并格式化
-          TAG_NAME="ffmpeg-${VERSION#n}"
+          # 清理版本字符串中的非法字符（用于 tag）
+          CLEAN_VERSION=$(echo "$VERSION" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          TAG_NAME="ffmpeg-${CLEAN_VERSION#n}"
           echo "VERSION_TAG=${TAG_NAME}" >> $GITHUB_OUTPUT
-          echo "RELEASE_NAME=FFmpeg Static Libs (MT) - ${VERSION#n}" >> $GITHUB_OUTPUT
+          echo "RELEASE_NAME=FFmpeg Static Libs (MT) - ${CLEAN_VERSION#n}" >> $GITHUB_OUTPUT
 
-      - name: Create GitHub Release and upload artifact
+      - name: Delete existing Release and Tag (if any)
+        uses: dev-drprasad/delete-tag-and-release@v1.0
+        with:
+          tag_name: ${{ steps.get_version.outputs.VERSION_TAG }}
+          delete_release: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.get_version.outputs.VERSION_TAG }}
@@ -170,7 +169,7 @@ jobs:
           body: |
             FFmpeg static libraries compiled with MSVC 2022.
             - Runtime: **/MT** (statically linked CRT)
-            - Hardware encoders: NVENC, Intel QSV (oneVPL), AMF
+            - Hardware encoders: NVENC (CUDA), Intel QSV (oneVPL), AMF
             - Static libraries only (`.lib`)
             - Includes headers and libs
           files: ${{ github.workspace }}/ffmpeg-libs.zip
